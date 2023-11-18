@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Serverless patterns - Amazon Kinesis Data Stream to Amazon EventBridge Message Bus using Amazon EventBridge Pipes'
+
+Parameters:
+  KinesisStreamName:
+    Type: String
+    Default: 'pipes-data-stream'
+    Description: 'Enter the name of a Amazon Kinesis Data Stream to create where source events will be streamed'
+  EventBridgeBusName:
+    Type: String
+    Default: 'MyPipesKinesisEventBus'
+    Description: 'The name of the Amazon EventBridge custom event bus to create and publish produced on the Amazon Kinesis Data Stream'
+  CloudWatchLogGroup:
+    Type: String
+    Default: '/aws/events/kinesis-to-eventbridge'
+    Description: 'The name of the Amazon CloudWatch Log Group to write events produced and published to the Amazon EventBridge message bus'
+  
+Resources:
+  # An Amazon Kinesis Data Stream to act as an Event Producer
+  KinesisEventProducer:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref KinesisStreamName 
+      RetentionPeriodHours: 24
+      ShardCount: 1
+      StreamEncryption: 
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED 
+
+  # Amazon EventBridge Event Bus (Target) for messages
+  ApplicationEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Ref EventBridgeBusName 
+
+  # IAM Role used by the Amazon EventBridge Pipe to process messages
+  PipeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pipes.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SourcePolicy-KinesisStream
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kinesis:DescribeStream'
+                  - 'kinesis:DescribeStreamSummary'
+                  - 'kinesis:GetRecords'
+                  - 'kinesis:GetShardIterator'
+                  - 'kinesis:ListStreams'
+                  - 'kinesis:ListShards'
+                Resource: !GetAtt KinesisEventProducer.Arn
+        - PolicyName: TargetPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource: !GetAtt ApplicationEventBus.Arn
+        - PolicyName: DeadLetterQueue
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                Resource: !GetAtt PipesDLQ.Arn
+
+  PipesDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+       QueueName: dlq-kinesis-to-eventbridge
+       KmsMasterKeyId: alias/aws/sqs
+       MessageRetentionPeriod: 345600
+
+  # EventBridge Pipe to consume messages from Amazon Kinesis Data Stream and publish to a Custom Event Bridge Message Bus          
+  Pipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: kinesis-to-eventbridge
+      Description: 'Pipe to connect Amazon Kinesis Data Stream to Amazon EventBridge event bus'
+      RoleArn: !GetAtt PipeRole.Arn
+      Source: !GetAtt KinesisEventProducer.Arn
+      SourceParameters:
+        KinesisStreamParameters:
+          BatchSize: 1
+          DeadLetterConfig:
+            Arn: !GetAtt PipesDLQ.Arn
+          StartingPosition: LATEST
+          MaximumRetryAttempts: 3
+      Target: !GetAtt ApplicationEventBus.Arn
+      TargetParameters:
+        EventBridgeEventBusParameters:
+          DetailType: 'StreamEventProduced'
+          Source: 'com.aws.pipes-data-stream'
+        InputTemplate : !Sub >
+          {
+            "pipeArn": "<aws.pipes.pipe-arn>",
+            "pipeIngestionTime": "<aws.pipes.event.ingestion-time>",
+            "eventSource": <$.eventSource>,
+            "eventSourceARN": <$.eventSourceARN>,
+            "eventID": <$.eventID>,
+            "data": <$.data>
+          }
+
+  # An EventBridge rule to write events forwarded from the EventBridge Pipe to a CloudWatch Log Group
+  LogsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref ApplicationEventBus
+      EventPattern:
+        source: 
+          - 'com.aws.pipes-data-stream'
+      Targets:
+        - Arn: !GetAtt LogGroupForEvents.Arn
+          Id: LogTarget
+  
+  # Amazon CloudWatch Log Group to write events
+  LogGroupForEvents:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref CloudWatchLogGroup
+      
+  # Policy to allow The AmazonEventBridge Rule to write to the CloudWatch Log group
+  LogGroupForEventsPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: "EventBridgeLogPolicy"
+      PolicyDocument: !Sub >
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "EventBridgetoCWLogsCreateLogStreamPolicy",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "events.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "logs:CreateLogStream"
+              ],
+              "Resource": [
+                "${LogGroupForEvents.Arn}"
+              ]
+            },
+            {
+              "Sid": "EventBridgetoCWLogsPutLogEventsPolicy",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "events.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "logs:PutLogEvents"
+              ],
+              "Resource": [
+                "${LogGroupForEvents.Arn}"
+              ],
+              "Condition": {
+                "ArnEquals": {"AWS:SourceArn": "${LogsRule.Arn}"}
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Output for the Amazon Kinesis Data Stream
+  KinesisEventProducerArn:
+    Description: 'The ARN of the Amazon Kinesis Data Stream acting as a producer'
+    Value: !GetAtt KinesisEventProducer.Arn
+  # Output for the Amazon EventBridge Pipe
+  PipeArn:
+    Description: 'The ARN of the Amazon EventBridge Pipe'
+    Value: !GetAtt Pipe.Arn
+  # Output for the Amazon EventBridge Custom Message Bus
+  EventBridgeBusArn:
+    Description: 'The ARN of the Amazon EventBridge Custom Message bus receiving events from Amazon MQ'
+    Value: !GetAtt ApplicationEventBus.Arn
+  # Output for the Amazon EventBridge Pipe Dead Letter Queue
+  PipeDLQArn:
+    Description: 'The ARN of the Amazon SQS queue acting as a Dead Letter Queue for the Amazon EventBridge Pipe'
+    Value: !GetAtt PipesDLQ.Arn
+  # Output for the Amazon CloudWatch Log Group
+  CloudWatchLogsArn:
+    Description: 'The ARN of the Amazon CloudWatch Log Group to write events received on the Amazon EventBridge Custom Message bus.'
+    Value: !GetAtt LogGroupForEvents.Arn
